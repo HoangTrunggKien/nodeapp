@@ -1,0 +1,116 @@
+stages:
+  - test
+  - scan
+  - build
+  - deploy
+  - rollback
+
+default:
+  interruptible: true
+  rules:
+    - changes:
+        - "README.md"
+      when: never
+    - when: always
+
+variables:
+  HARBOR_REGISTRY: registry.hoangkien.com
+  HARBOR_PROJECT: nodejs-app-project
+  IMAGE_NAME: $HARBOR_REGISTRY/$HARBOR_PROJECT/nodejs-app
+  IMAGE_TAG: $CI_COMMIT_SHORT_SHA
+  K8S_NAMESPACE: nodejs-app-namespace
+  K8S_DEPLOYMENT: nodejs-app-deployment
+  ROLLBACK_REVISION: ""
+
+cache:
+  paths:
+    - node_modules/
+
+test:
+  stage: test
+  image: node:22-alpine
+  timeout: 10m
+  script:
+    - npm install
+    - npm run test
+  tags:
+    - gitlab-runner
+
+security-scan:
+  stage: scan
+  image: aquasec/trivy:latest
+  timeout: 15m
+  before_script:
+    - echo "$HARBOR_PASSWORD" | docker login -u "$HARBOR_USER" --password-stdin "$HARBOR_REGISTRY"
+  script:
+    - docker build -t $IMAGE_NAME:$IMAGE_TAG .
+    - trivy image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed --skip-dirs usr/local/lib/node_modules $IMAGE_NAME:$IMAGE_TAG
+  after_script:
+    - docker logout $HARBOR_REGISTRY
+  tags:
+    - gitlab-runner
+
+build-image:
+  stage: build
+  timeout: 20m
+  needs: ["test", "security-scan"]
+  before_script:
+    - echo "$HARBOR_PASSWORD" | docker login -u "$HARBOR_USER" --password-stdin "$HARBOR_REGISTRY"
+  script:
+    - docker build -t $IMAGE_NAME:$IMAGE_TAG .
+    - docker tag $IMAGE_NAME:$IMAGE_TAG $IMAGE_NAME:latest
+    - docker push $IMAGE_NAME:$IMAGE_TAG
+    - docker push $IMAGE_NAME:latest
+  after_script:
+    - docker logout $HARBOR_REGISTRY
+  tags:
+    - gitlab-runner
+
+deploy-to-k8s:
+  stage: deploy
+  before_script:
+    - echo "$KUBE_CONFIG" | base64 -d > kubeconfig.yaml
+  script:
+    - kubectl --kubeconfig=kubeconfig.yaml set image deployment/$K8S_DEPLOYMENT nodejs-app=$IMAGE_NAME:$IMAGE_TAG -n $K8S_NAMESPACE
+    - kubectl --kubeconfig=kubeconfig.yaml rollout status deployment/$K8S_DEPLOYMENT -n $K8S_NAMESPACE --timeout=300s
+    - kubectl --kubeconfig=kubeconfig.yaml annotate deployment/$K8S_DEPLOYMENT kubernetes.io/change-cause="Deploy version $IMAGE_TAG" -n $K8S_NAMESPACE --overwrite
+  after_script:
+    - rm -f kubeconfig.yaml
+  only:
+    - develop
+  environment:
+    name: staging
+    url: http://nodejs.kienhoang.com
+  tags:
+    - gitlab-runner
+
+rollback:
+  stage: rollback
+  before_script:
+    - echo "$KUBE_CONFIG" | base64 -d > kubeconfig.yaml
+    - |
+      if [ -z "$ROLLBACK_REVISION" ]; then
+        echo "No ROLLBACK_REVISION specified, will rollback to previous revision"
+      else
+        echo "Rolling back to revision $ROLLBACK_REVISION"
+        ROLLBACK_ARG="--to-revision=$ROLLBACK_REVISION"
+      fi
+  script:
+    - kubectl --kubeconfig=kubeconfig.yaml rollout undo deployment/$K8S_DEPLOYMENT -n $K8S_NAMESPACE $ROLLBACK_ARG
+    - kubectl --kubeconfig=kubeconfig.yaml rollout status deployment/$K8S_DEPLOYMENT -n $K8S_NAMESPACE --timeout=300s
+    - |
+      if [ -z "$ROLLBACK_REVISION" ]; then
+        kubectl --kubeconfig=kubeconfig.yaml annotate deployment/$K8S_DEPLOYMENT kubernetes.io/change-cause="Rollback to previous revision" -n $K8S_NAMESPACE --overwrite
+      else
+        kubectl --kubeconfig=kubeconfig.yaml annotate deployment/$K8S_DEPLOYMENT kubernetes.io/change-cause="Rollback to revision $ROLLBACK_REVISION" -n $K8S_NAMESPACE --overwrite
+      fi
+  after_script:
+    - rm -f kubeconfig.yaml
+  only:
+    - main
+    - develop
+  when: manual
+  environment:
+    name: staging
+  tags:
+    - gitlab-runner
